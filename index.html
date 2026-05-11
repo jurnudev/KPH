@@ -823,54 +823,59 @@
 
       // Update confirmed state from API poll (respects lock & cooldown)
       updateFromPoll(zone, apiValue) {
-        if (this.isLocked(zone)) return;      // toggle in-flight, ignore poll
-        if (this.isInCooldown(zone)) return;   // recently toggled, wait for cooldown
+        // If we are currently sending a toggle request, ignore polling for a moment
+        if (this.isLocked(zone)) return;
+        // If we just finished a toggle, wait for the server state to stabilize
+        if (this.isInCooldown(zone)) return;
 
         const newState = String(apiValue === '1' ? '1' : '0');
-        this.confirmedState[zone] = newState;
-        this._renderZone(zone);
+        
+        // Only update if the state has actually changed to avoid redundant renders
+        if (this.confirmedState[zone] !== newState) {
+          this.confirmedState[zone] = newState;
+          this._renderZone(zone);
+          console.log(`Zone ${zone} updated from API: ${newState}`);
+        }
       },
 
-      // Toggle a valve zone — the core fix
+      // Toggle a valve zone — strictly driven by API response
       async toggle(zone) {
-        if (this.isLocked(zone)) return; // prevent double-tap
+        if (this.isLocked(zone)) return; 
 
-        // Read current confirmed state from manager, NOT from CSS
-        const currentState = this.confirmedState[zone];
+        // 1. Determine next state based on CURRENT confirmed state
+        const currentState = this.confirmedState[zone] || '0';
         const nextValue = (currentState === '1') ? '0' : '1';
         const pin = this.controlPin(zone);
 
-        // Lock this zone
+        // 2. Lock and show loading state
         this.locked[zone] = true;
         this._renderZoneLoading(zone, true);
 
+        console.log(`Toggling Zone ${zone}: ${currentState} -> ${nextValue}`);
+
         try {
-          // 1. Send update to Blynk API
+          // 3. Send update to Blynk API
           const res = await fetch(`${BASE_URL}/update/${pin}?value=${nextValue}`, {
+            method: 'GET',
+            mode: 'cors',
             signal: AbortSignal.timeout(CONFIG.TIMEOUT)
           });
 
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-          // 2. Immediately re-fetch the pin to confirm the server accepted it
-          const confirmed = await fetchPin(pin);
-
-          if (confirmed !== null) {
-            // Server confirmed the new value
-            this.confirmedState[zone] = String(confirmed);
-          } else {
-            // Re-fetch failed, optimistically trust the write succeeded
-            // Next poll will correct if needed
-            this.confirmedState[zone] = nextValue;
-          }
-
+          // 4. Update local confirmed state immediately to reflect the successful write
+          // This prevents the 'bounce' before the next poll arrives
+          this.confirmedState[zone] = nextValue;
+          
         } catch (e) {
-          // Failed — do NOT change state, silently ignore
+          console.error(`Toggle Zone ${zone} failed:`, e);
+          // On failure, we don't change the confirmed state, 
+          // the next successful poll will restore the correct UI
         } finally {
-          // 3. Set cooldown to prevent poll from overwriting too quickly
+          // 5. Set a cooldown to ignore polling results that might contain 'stale' data
           this.cooldownUntil[zone] = Date.now() + CONFIG.VALVE_COOLDOWN;
 
-          // 4. Unlock and render
+          // 6. Unlock and render
           this.locked[zone] = false;
           this._renderZoneLoading(zone, false);
           this._renderZone(zone);
@@ -996,12 +1001,11 @@
 
         // Update valve states through ValveManager (respects lock & cooldown)
         for (let i = 1; i <= 4; i++) {
-          const stat = data[`V${i + 3}`];   // status pin V4-V7
-          const ctrl = data[`V${i - 1}`];   // control pin V0-V3
-          // Prefer status pin if available, else use control pin
-          const apiValue = (stat !== null && stat !== undefined) ? stat : ctrl;
-          if (apiValue !== null && apiValue !== undefined) {
-            ValveManager.updateFromPoll(i, String(apiValue));
+          const ctrl = data[`V${i - 1}`];   // control pin V0-V3 (Matches firmware #defines)
+          
+          // Use the control pin directly as the source of truth for the UI
+          if (ctrl !== null && ctrl !== undefined) {
+            ValveManager.updateFromPoll(i, String(ctrl));
           }
         }
 
